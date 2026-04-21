@@ -1,0 +1,104 @@
+// lsp/src/completion.ltl — textDocument/completion provider.
+//
+// Returns CompletionItems for the given (uri, line, character). Uses
+// the compiler frontend's partial-parse and name-resolution state:
+// at the cursor we classify the context (dotted path, import stmt,
+// generic position, bare ident) and filter candidates accordingly.
+
+use analysis::{Index, CursorContext, Symbol, SymbolKind}
+use encoding::json::Value as Json
+use text::fuzzy
+
+pub struct CompletionProvider { pub index: Index }
+
+pub enum CompletionItemKind {
+    Text=1, Method=2, Function=3, Constructor=4, Field=5, Variable=6,
+    Class=7, Interface=8, Module=9, Property=10, Unit=11, Value=12,
+    Enum=13, Keyword=14, Snippet=15, Color=16, File=17, Reference=18,
+    Folder=19, EnumMember=20, Constant=21, Struct=22, Event=23,
+    Operator=24, TypeParameter=25,
+}
+
+pub fn provide(p: &CompletionProvider, uri: &str, line: u32, col: u32) -> Json {
+    let Some(ctx) = p.index.cursor_context(uri, line, col) else {
+        return json::object!{ "isIncomplete": false, "items": [] }
+    }
+    let prefix = ctx.prefix.as_str()
+    let mut items: Vec<Json> = Vec::new()
+
+    match ctx {
+        CursorContext::DottedPath { receiver_ty, .. } => {
+            // Member access: list methods, fields, and associated items.
+            for sym in p.index.members_of(&receiver_ty) {
+                if prefix.is_empty() || fuzzy::match_score(prefix, sym.name.as_str()) > 0 {
+                    items.push(to_item(&sym, /*snippet=*/true))
+                }
+            }
+        }
+        CursorContext::UseStatement { .. } => {
+            for m in p.index.visible_modules() {
+                items.push(json::object!{
+                    "label": &m.path,
+                    "kind": CompletionItemKind::Module as u32,
+                    "detail": "module",
+                })
+            }
+        }
+        CursorContext::BareIdent { scope, .. } => {
+            for sym in p.index.symbols_in_scope(scope) {
+                let score = fuzzy::match_score(prefix, sym.name.as_str())
+                if score > 0 || prefix.is_empty() {
+                    let mut item = to_item(&sym, true)
+                    item["sortText"] = Json::from(format!("{:010}", u32::MAX - score as u32))
+                    items.push(item)
+                }
+            }
+            for kw in ["fn","let","mut","pub","struct","enum","impl","trait","match","if","else","for","while","loop","return","use","mod","async","await"] {
+                if fuzzy::match_score(prefix, kw) > 0 {
+                    items.push(json::object!{
+                        "label": kw, "kind": CompletionItemKind::Keyword as u32,
+                    })
+                }
+            }
+        }
+        CursorContext::Unknown => {}
+    }
+
+    json::object!{ "isIncomplete": false, "items": items }
+}
+
+fn to_item(sym: &Symbol, snippet: bool) -> Json {
+    let kind = match sym.kind {
+        SymbolKind::Function => CompletionItemKind::Function,
+        SymbolKind::Method   => CompletionItemKind::Method,
+        SymbolKind::Struct   => CompletionItemKind::Struct,
+        SymbolKind::Enum     => CompletionItemKind::Enum,
+        SymbolKind::Field    => CompletionItemKind::Field,
+        SymbolKind::Variable => CompletionItemKind::Variable,
+        SymbolKind::Const    => CompletionItemKind::Constant,
+        SymbolKind::Module   => CompletionItemKind::Module,
+        SymbolKind::Trait    => CompletionItemKind::Interface,
+        SymbolKind::TypeAlias=> CompletionItemKind::Class,
+    }
+    let mut item = json::object!{
+        "label": sym.name.clone(),
+        "kind":  kind as u32,
+        "detail": sym.signature.clone().unwrap_or_default(),
+    }
+    if let Some(doc) = &sym.doc {
+        item["documentation"] = json::object!{ "kind": "markdown", "value": doc.clone() };
+    }
+    if snippet {
+        if let Some(params) = &sym.params {
+            let mut snip = format!("{}(", sym.name)
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 { snip.push_str(", ") }
+                snip.push_str(&format!("${{{}:{}}}", i + 1, p))
+            }
+            snip.push(')')
+            item["insertText"] = Json::from(snip)
+            item["insertTextFormat"] = Json::from(2) // Snippet
+        }
+    }
+    item
+}
