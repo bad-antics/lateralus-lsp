@@ -1,0 +1,77 @@
+// lsp/src/diagnostics.ltl — textDocument/publishDiagnostics driver.
+//
+// Runs on every textDocument/didChange (debounced 250ms) and
+// emits a notification with all errors + warnings from the compiler
+// frontend. Severity maps 1=Error, 2=Warning, 3=Info, 4=Hint.
+
+use analysis::{Index, Diagnostic as CompilerDiag, Severity}
+use encoding::json::Value as Json
+use time::{Instant, Duration}
+use sync::mutex::Mutex
+use collections::hashmap::HashMap
+
+use crate::transport::Transport
+
+pub struct Diagnostics {
+    debounce: Duration,
+    pending:  Mutex<HashMap<String, Instant>>,
+}
+
+impl Diagnostics {
+    pub fn new() -> Self {
+        Self { debounce: Duration::from_millis(250), pending: Mutex::new(HashMap::new()) }
+    }
+
+    pub fn schedule(&self, uri: &str) {
+        self.pending.lock().insert(uri.to_string(), Instant::now())
+    }
+
+    pub fn tick(&self, index: &Index, t: &Transport) {
+        let now = Instant::now()
+        let ready: Vec<String> = {
+            let mut p = self.pending.lock()
+            let ready: Vec<String> = p.iter()
+                .filter(|(_, scheduled)| now.duration_since(**scheduled) >= self.debounce)
+                .map(|(uri, _)| uri.clone())
+                .collect()
+            for u in &ready { p.remove(u); }
+            ready
+        }
+        for uri in ready {
+            let diags = index.diagnostics(&uri)
+            let _ = t.notify("textDocument/publishDiagnostics", json::object!{
+                "uri": uri.clone(),
+                "diagnostics": diags.iter().map(to_lsp).collect::<Vec<_>>(),
+            })
+        }
+    }
+}
+
+fn to_lsp(d: &CompilerDiag) -> Json {
+    let severity = match d.severity {
+        Severity::Error => 1, Severity::Warning => 2,
+        Severity::Info => 3,  Severity::Hint => 4,
+    }
+    let range = json::object!{
+        "start": { "line": d.span.start_line, "character": d.span.start_col },
+        "end":   { "line": d.span.end_line,   "character": d.span.end_col   },
+    }
+    let mut item = json::object!{
+        "range": range, "severity": severity,
+        "source": "lateralus", "message": d.message.clone(),
+    }
+    if let Some(code) = &d.code { item["code"] = Json::from(code.clone()); }
+    if !d.related.is_empty() {
+        item["relatedInformation"] = Json::Array(d.related.iter().map(|r| json::object!{
+            "location": {
+                "uri": r.uri.clone(),
+                "range": {
+                    "start": { "line": r.span.start_line, "character": r.span.start_col },
+                    "end":   { "line": r.span.end_line,   "character": r.span.end_col   },
+                }
+            },
+            "message": r.message.clone(),
+        }).collect())
+    }
+    item
+}
