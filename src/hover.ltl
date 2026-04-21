@@ -1,0 +1,48 @@
+// lsp/src/hover.ltl — textDocument/hover provider.
+//
+// Returns a MarkupContent (markdown) block describing the symbol
+// under the cursor: its fully-qualified path, signature, rendered
+// type information, and the first paragraph of its doc comment.
+
+use analysis::{Index, Symbol, SymbolKind}
+use encoding::json::Value as Json
+
+pub struct HoverProvider { pub index: Index }
+
+pub fn provide(p: &HoverProvider, uri: &str, line: u32, col: u32) -> Json {
+    let Some(sym) = p.index.symbol_at(uri, line, col) else {
+        return Json::Null
+    }
+    let md = render_markdown(&sym)
+    let range = json::object!{
+        "start": { "line": sym.span.start_line, "character": sym.span.start_col },
+        "end":   { "line": sym.span.end_line,   "character": sym.span.end_col   },
+    }
+    json::object!{
+        "contents": { "kind": "markdown", "value": md },
+        "range": range,
+    }
+}
+
+fn render_markdown(sym: &Symbol) -> String {
+    let kind_label = match sym.kind {
+        SymbolKind::Function => "fn",  SymbolKind::Method   => "method",
+        SymbolKind::Struct   => "struct", SymbolKind::Enum  => "enum",
+        SymbolKind::Field    => "field", SymbolKind::Variable => "let",
+        SymbolKind::Const    => "const", SymbolKind::Module => "mod",
+        SymbolKind::Trait    => "trait", SymbolKind::TypeAlias => "type",
+    }
+    let mut md = String::new()
+    md.push_str("```lateralus\n")
+    md.push_str(&format!("{} {}", kind_label, sym.fully_qualified_name()))
+    if let Some(sig) = &sym.signature { md.push_str(&format!("\n{}", sig)) }
+    md.push_str("\n```\n")
+    if let Some(doc) = &sym.doc {
+        md.push_str("\n---\n\n")
+        md.push_str(doc)
+    }
+    if !sym.defined_in.is_empty() {
+        md.push_str(&format!("\n\n*defined in* `{}`", sym.defined_in))
+    }
+    md
+}
