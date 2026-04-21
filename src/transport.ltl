@@ -1,0 +1,102 @@
+// lsp/src/transport.ltl — Language Server Protocol transport layer.
+//
+// Implements the LSP base protocol over stdio per the official spec:
+// every message is "Content-Length: N\r\n\r\n<N bytes of UTF-8 JSON>".
+// The body is JSON-RPC 2.0 — request/response pairs with `id` fields,
+// plus one-way "notifications" without an id.
+//
+// Two byte pumps: a read loop that feeds the main dispatcher and a
+// write side guarded by a mutex so any thread (e.g. a background
+// diagnostics task) can emit notifications safely.
+
+use io::{BufReader, BufWriter, Stdin, Stdout, Read, Write}
+use encoding::json::Value as Json
+use sync::mutex::Mutex
+
+pub struct Transport {
+    reader: Mutex<BufReader<Stdin>>,
+    writer: Mutex<BufWriter<Stdout>>,
+}
+
+impl Transport {
+    pub fn new(stdin: Stdin, stdout: Stdout) -> Self {
+        Self {
+            reader: Mutex::new(BufReader::with_capacity(64 * 1024, stdin)),
+            writer: Mutex::new(BufWriter::with_capacity(64 * 1024, stdout)),
+        }
+    }
+
+    pub fn read_message(&self) -> Result<Json, TransportError> {
+        let mut r = self.reader.lock()
+        let mut content_len: Option<usize> = None
+
+        // Header block: "Header: Value\r\n" repeated, ended by "\r\n".
+        loop {
+            let line = read_crlf_line(&mut *r)?
+            if line.is_empty() { break }
+            if let Some((k, v)) = line.split_once(':') {
+                let k = k.trim().to_ascii_lowercase()
+                let v = v.trim()
+                if k == "content-length" {
+                    content_len = Some(v.parse().map_err(|_| TransportError::BadHeader)?)
+                }
+                // "content-type" is allowed but informational — we assume utf-8 JSON.
+            }
+        }
+
+        let n = content_len.ok_or(TransportError::MissingContentLength)?
+        if n > 16 * 1024 * 1024 { return Err(TransportError::MessageTooLarge) }
+
+        let mut body = vec![0u8; n]
+        r.read_exact(&mut body).map_err(TransportError::Io)?
+        let v: Json = json::from_slice(&body).map_err(|_| TransportError::BadJson)?
+        Ok(v)
+    }
+
+    pub fn write_message(&self, msg: &Json) -> Result<(), TransportError> {
+        let body = json::to_vec(msg).map_err(|_| TransportError::BadJson)?
+        let mut w = self.writer.lock()
+        write!(*w, "Content-Length: {}\r\n\r\n", body.len()).map_err(TransportError::Io)?
+        w.write_all(&body).map_err(TransportError::Io)?
+        w.flush().map_err(TransportError::Io)?
+        Ok(())
+    }
+
+    pub fn notify(&self, method: &str, params: Json) -> Result<(), TransportError> {
+        self.write_message(&json::object!{
+            "jsonrpc": "2.0", "method": method, "params": params,
+        })
+    }
+
+    pub fn respond(&self, id: &Json, result: Json) -> Result<(), TransportError> {
+        self.write_message(&json::object!{
+            "jsonrpc": "2.0", "id": id.clone(), "result": result,
+        })
+    }
+
+    pub fn error_response(&self, id: &Json, code: i32, msg: &str) -> Result<(), TransportError> {
+        self.write_message(&json::object!{
+            "jsonrpc": "2.0", "id": id.clone(),
+            "error": { "code": code, "message": msg },
+        })
+    }
+}
+
+fn read_crlf_line<R: Read>(r: &mut R) -> Result<String, TransportError> {
+    let mut buf = Vec::with_capacity(80)
+    let mut b = [0u8; 1]
+    loop {
+        if r.read(&mut b).map_err(TransportError::Io)? == 0 {
+            return Err(TransportError::Eof)
+        }
+        if b[0] == b'\n' {
+            if buf.last() == Some(&b'\r') { buf.pop(); }
+            return String::from_utf8(buf).map_err(|_| TransportError::BadHeader)
+        }
+        buf.push(b[0])
+        if buf.len() > 8 * 1024 { return Err(TransportError::BadHeader) }
+    }
+}
+
+pub enum TransportError { Io(io::Error), Eof, BadHeader, MissingContentLength,
+                          MessageTooLarge, BadJson }
