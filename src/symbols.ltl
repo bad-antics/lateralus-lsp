@@ -1,0 +1,74 @@
+// lsp/src/symbols.ltl — documentSymbol + workspace/symbol providers.
+//
+// documentSymbol returns a hierarchical outline used by VS Code's
+// outline panel and breadcrumb bar. workspace/symbol does
+// fuzzy-match across the whole project and is what powers Ctrl+T.
+
+use analysis::{Index, Symbol, SymbolKind, Span}
+use encoding::json::Value as Json
+use text::fuzzy
+
+pub struct SymbolProvider { pub index: Index }
+
+pub fn document_symbols(p: &SymbolProvider, uri: &str) -> Json {
+    let Some(tree) = p.index.document_tree(uri) else {
+        return Json::Array(Vec::new())
+    }
+    Json::Array(tree.iter().map(to_document_symbol).collect())
+}
+
+fn to_document_symbol(sym: &Symbol) -> Json {
+    let kind = kind_to_lsp(sym.kind) as u32
+    let range     = span_to_range(&sym.full_span)
+    let sel_range = span_to_range(&sym.name_span)
+    let mut item = json::object!{
+        "name":           sym.name.clone(),
+        "detail":         sym.signature.clone().unwrap_or_default(),
+        "kind":           kind,
+        "range":          range,
+        "selectionRange": sel_range,
+    }
+    if !sym.children.is_empty() {
+        item["children"] = Json::Array(sym.children.iter().map(to_document_symbol).collect())
+    }
+    item
+}
+
+pub fn workspace_symbols(p: &SymbolProvider, query: &str) -> Json {
+    // Fuzzy-score every symbol in the index; take top 256 by score.
+    let mut scored: Vec<(i32, &Symbol)> = Vec::new()
+    for s in p.index.all_symbols() {
+        let score = fuzzy::match_score(query, s.name.as_str())
+        if score > 0 { scored.push((score, s)) }
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0))
+    scored.truncate(256)
+
+    Json::Array(scored.iter().map(|(_, sym)| json::object!{
+        "name": sym.name.clone(),
+        "kind": kind_to_lsp(sym.kind) as u32,
+        "containerName": sym.container.clone().unwrap_or_default(),
+        "location": {
+            "uri":   sym.defined_in.clone(),
+            "range": span_to_range(&sym.name_span),
+        }
+    }).collect())
+}
+
+fn kind_to_lsp(k: SymbolKind) -> u32 {
+    // LSP SymbolKind enum values.
+    match k {
+        SymbolKind::Module    => 2,  SymbolKind::Struct => 23,
+        SymbolKind::Enum      => 10, SymbolKind::Trait  => 11,
+        SymbolKind::TypeAlias => 5,  SymbolKind::Function => 12,
+        SymbolKind::Method    => 6,  SymbolKind::Field    => 8,
+        SymbolKind::Variable  => 13, SymbolKind::Const    => 14,
+    }
+}
+
+fn span_to_range(s: &Span) -> Json {
+    json::object!{
+        "start": { "line": s.start_line, "character": s.start_col },
+        "end":   { "line": s.end_line,   "character": s.end_col   },
+    }
+}
